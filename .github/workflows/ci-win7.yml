@@ -1,0 +1,101 @@
+name: Build pydantic-core wheel for Windows 7
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ccomac/pydantic git tag, branch, or commit"
+        required: true
+        default: "main"
+      interpreter:
+        description: "CPython version to build for; it must match the target Python minor version"
+        required: true
+        default: "3.12"
+
+env:
+  COLUMNS: 150
+  FORCE_COLOR: 1
+  CI: "1"
+  RUST_TARGET: x86_64-win7-windows-msvc
+
+jobs:
+  core-build-win7:
+    name: pydantic-core / Windows 7 x64 / Python ${{ inputs.interpreter }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out pydantic
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: pydantic/pydantic
+          ref: ${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Set up uv and CPython
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: ${{ inputs.interpreter }}
+          enable-cache: false
+
+      # Win7 is a Rust Tier 3 target and has no prebuilt standard library.
+      - name: Set up Rust nightly for the Win7 target
+        id: rust-toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Verify the Rust target
+        shell: bash
+        run: |
+          rustc --print cfg --target "$RUST_TARGET" | grep 'target_vendor="win7"'
+
+      - name: Build Windows 7 wheel
+        working-directory: pydantic-core
+        shell: bash
+        run: |
+          uv build \
+            --python "${{ inputs.interpreter }}" \
+            --wheel \
+            --out-dir dist \
+            --config-settings="build-args=--interpreter ${{ inputs.interpreter }} --target $RUST_TARGET -Z build-std=std,panic_abort"
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+
+      - name: Verify the wheel ABI tag
+        shell: pwsh
+        working-directory: pydantic-core
+        run: |
+          $abi = "cp${{ inputs.interpreter }}".Replace(".", "")
+          $wheels = @(Get-ChildItem -LiteralPath dist -Filter *.whl)
+
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one wheel in dist, found $($wheels.Count)."
+          }
+
+          $expectedSuffix = "-$abi-$abi-win_amd64.whl"
+          if (-not $wheels[0].Name.EndsWith($expectedSuffix)) {
+            throw "Expected a wheel ending in '$expectedSuffix', got '$($wheels[0].Name)'."
+          }
+
+          $wheels[0] | Format-Table Name,Length
+          "WHEEL_PATH=$($wheels[0].FullName)" >> $env:GITHUB_ENV
+
+      - name: Test the wheel with the matching CPython
+        shell: pwsh
+        working-directory: pydantic-core
+        run: |
+          uv venv --python "${{ inputs.interpreter }}" .wheel-test
+          uv pip install --python .wheel-test/Scripts/python.exe $env:WHEEL_PATH
+          & .\.wheel-test\Scripts\python.exe -c "import pydantic_core; print(pydantic_core.__version__)"
+
+      - name: Upload pydantic-core wheel
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pydantic-core-win7-x64-py${{ inputs.interpreter }}
+          path: pydantic-core/dist/*.whl
+          if-no-files-found: error
