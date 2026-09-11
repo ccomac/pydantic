@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "ccomac/pydantic git tag, branch, or commit"
+        description: "pydantic/pydantic git tag, branch, or commit"
         required: true
         default: "main"
       interpreter:
