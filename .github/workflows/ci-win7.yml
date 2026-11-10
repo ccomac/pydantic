@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "pydantic/pydantic git tag, branch, or commit"
+        description: "pydantic/pydantic core tag, branch, or commit"
         required: true
-        default: "main"
+        default: "core-v2.50.4"
       interpreter:
         description: "CPython version to build for; it must match the target Python minor version"
         required: true
@@ -29,22 +29,21 @@ jobs:
 
     steps:
       - name: Check out pydantic
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: pydantic/pydantic
           ref: ${{ inputs.version }}
           persist-credentials: false
 
       - name: Set up uv and CPython
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: ${{ inputs.interpreter }}
           enable-cache: false
 
       # Win7 is a Rust Tier 3 target and has no prebuilt standard library.
       - name: Set up Rust nightly for the Win7 target
-        id: rust-toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           components: rust-src
@@ -54,15 +53,60 @@ jobs:
         run: |
           rustc --print cfg --target "$RUST_TARGET" | grep 'target_vendor="win7"'
 
+      - name: Verify pydantic-core version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata `
+            --format-version 1 `
+            --no-deps `
+            --locked `
+            --quiet `
+            --manifest-path pydantic-core/Cargo.toml | ConvertFrom-Json
+          $core = @($metadata.packages | Where-Object name -eq "pydantic-core")
+
+          if ($core.Count -ne 1) {
+            throw "Expected exactly one pydantic-core package, found $($core.Count)."
+          }
+
+          $coreVersion = $core[0].version
+          $sourceRef = "${{ inputs.version }}"
+          if ($sourceRef.StartsWith("core-v")) {
+            $expectedVersion = $sourceRef.Substring(6)
+            if ($coreVersion -ne $expectedVersion) {
+              throw "Ref '$sourceRef' contains pydantic-core $coreVersion, expected $expectedVersion."
+            }
+          }
+
+          Write-Host "Building pydantic-core $coreVersion"
+          "CORE_VERSION=$coreVersion" >> $env:GITHUB_ENV
+
+      - name: Configure the CPython import library
+        shell: pwsh
+        run: |
+          $pythonExe = (uv python find "${{ inputs.interpreter }}").Trim()
+          $pythonBase = (& $pythonExe -c "import sys; print(sys.base_prefix)").Trim()
+          $pythonLibDir = Join-Path $pythonBase "libs"
+          $pythonAbi = "${{ inputs.interpreter }}".Replace(".", "")
+          $pythonImportLib = Join-Path $pythonLibDir "python$pythonAbi.lib"
+
+          if (-not (Test-Path -LiteralPath $pythonImportLib -PathType Leaf)) {
+            throw "CPython import library was not found at '$pythonImportLib'."
+          }
+
+          Write-Host "Using CPython import library: $pythonImportLib"
+          "LIB=$pythonLibDir;$env:LIB" >> $env:GITHUB_ENV
+
       - name: Build Windows 7 wheel
         working-directory: pydantic-core
         shell: bash
         run: |
-          uv build \
-            --python "${{ inputs.interpreter }}" \
-            --wheel \
-            --out-dir dist \
-            --config-settings="build-args=--interpreter ${{ inputs.interpreter }} --target $RUST_TARGET -Z build-std=std,panic_abort"
+          uvx --from maturin==1.16.0 maturin build \
+            --release \
+            --locked \
+            --out dist \
+            --interpreter "${{ inputs.interpreter }}" \
+            --target "$RUST_TARGET" \
+            -Z build-std=std,panic_abort
         env:
           RUSTUP_TOOLCHAIN: nightly
 
@@ -91,11 +135,13 @@ jobs:
         run: |
           uv venv --python "${{ inputs.interpreter }}" .wheel-test
           uv pip install --python .wheel-test/Scripts/python.exe $env:WHEEL_PATH
-          & .\.wheel-test\Scripts\python.exe -c "import pydantic_core; print(pydantic_core.__version__)"
+          & .\.wheel-test\Scripts\python.exe -c "import os, pydantic_core; from pydantic_core._pydantic_core import build_info; print(pydantic_core.__version__); print(f'{build_info=}'); assert pydantic_core.__version__ == os.environ['EXPECTED_CORE_VERSION']"
+        env:
+          EXPECTED_CORE_VERSION: ${{ env.CORE_VERSION }}
 
       - name: Upload pydantic-core wheel
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pydantic-core-win7-x64-py${{ inputs.interpreter }}
+          name: pydantic-core-${{ env.CORE_VERSION }}-win7-x64-py${{ inputs.interpreter }}
           path: pydantic-core/dist/*.whl
           if-no-files-found: error
